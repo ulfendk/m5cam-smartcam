@@ -12,6 +12,7 @@
 // every endpoint with HTTP basic auth (user "admin").
 
 #include <Arduino.h>
+#include <memory>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <Update.h>
@@ -22,7 +23,7 @@
 #include <mbedtls/base64.h>
 
 #ifndef FW_VERSION
-#define FW_VERSION "1.0.2"
+#define FW_VERSION "1.1.0"
 #endif
 
 // M5Camera model B pin map (the M5CAM F "fisheye" board), read from the factory firmware's boot log.
@@ -162,6 +163,7 @@ static String statusJson() {
   String j = "{";
   j += "\"firmware\":\"" FW_VERSION "\",\"hostname\":\"" + hostname + "\",";
   j += "\"ip\":\"" + WiFi.localIP().toString() + "\",\"rssi\":" + String(WiFi.RSSI()) + ",";
+  j += "\"bssid\":\"" + WiFi.BSSIDstr() + "\",\"channel\":" + String(WiFi.channel()) + ",";
   j += "\"uptime_s\":" + String(millis() / 1000) + ",\"frames_sent\":" + String(framesSent) + ",";
   j += "\"stream_fps\":" + String(streamFps, 1) + ",\"free_psram\":" + String(ESP.getFreePsram()) + ",";
   j += "\"auth\":" + String(authHeader.isEmpty() ? "false" : "true");
@@ -204,22 +206,37 @@ static esp_err_t restartHandler(httpd_req_t *req) {
 static esp_err_t updateHandler(httpd_req_t *req) {
   if (!authorized(req)) return ESP_OK;
   if (!Update.begin(req->content_len)) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, Update.errorString());
-  char buf[2048];
+  Serial.printf("update: receiving %u bytes\n", req->content_len);
+  // On the heap: a buffer this size on the httpd task's stack overflowed it and crashed the camera.
+  const size_t kBuf = 4096;
+  std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[kBuf]);
+  if (!buf) {
+    Update.abort();
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+  }
   size_t left = req->content_len;
+  int timeouts = 0;
   while (left > 0) {
-    int n = httpd_req_recv(req, buf, min(left, sizeof buf));
-    if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    int n = httpd_req_recv(req, (char *)buf.get(), min(left, kBuf));
+    if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 6) continue;  // a slow link, up to a minute of silence
     if (n <= 0) {
+      Serial.println("update: connection lost, aborted (running firmware unchanged)");
       Update.abort();
       return ESP_FAIL;
     }
-    if (Update.write((uint8_t *)buf, n) != (size_t)n) {
+    timeouts = 0;
+    if (Update.write(buf.get(), n) != (size_t)n) {
+      Serial.printf("update: write failed: %s\n", Update.errorString());
       Update.abort();
       return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, Update.errorString());
     }
     left -= n;
   }
-  if (!Update.end(true)) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, Update.errorString());
+  if (!Update.end(true)) {
+    Serial.printf("update: rejected: %s\n", Update.errorString());
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, Update.errorString());
+  }
+  Serial.println("update: ok, restarting");
   httpd_resp_sendstr(req, "update ok, restarting\n");
   delay(500);
   ESP.restart();
@@ -257,6 +274,7 @@ static void startServers() {
   cfg.max_uri_handlers = 8;
   cfg.lru_purge_enable = true;
   cfg.recv_wait_timeout = 10;
+  cfg.stack_size = 8192;  // the default 4 KB is too tight for the OTA handler alongside the HTTP stack
   httpd_uri_t uris[] = {
       {"/", HTTP_GET, indexHandler, nullptr},          {"/capture", HTTP_GET, captureHandler, nullptr},
       {"/status", HTTP_GET, statusHandler, nullptr},   {"/control", HTTP_GET, controlHandler, nullptr},
@@ -383,7 +401,11 @@ void setup() {
   WiFi.setHostname(host);
   WiFi.setSleep(false);  // modem sleep adds hundreds of ms of jitter to the stream
   WiFi.setAutoReconnect(true);
+  // With several access points on one SSID, join the strongest, not the first one the scan happens to find.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   if (!connectWiFi(30000)) runPortal();
+  Serial.printf("wifi: on %s channel %d, rssi %d\n", WiFi.BSSIDstr().c_str(), WiFi.channel(), WiFi.RSSI());
 
   MDNS.begin(host);
   MDNS.addService("http", "tcp", 80);
@@ -392,9 +414,41 @@ void setup() {
                 WiFi.localIP().toString().c_str());
 }
 
+// Roaming: the ESP32 stays on its access point however weak it gets. If the signal has been poor for three
+// minutes, look for a clearly stronger AP with the same SSID and move to it. At most every ten minutes, since
+// the scan pauses the stream for a few seconds.
+static void roamIfWeak() {
+  static uint32_t lastCheck = 0, lastScan = 0;
+  static uint8_t weakChecks = 0;
+  if (millis() - lastCheck < 60000 || WiFi.status() != WL_CONNECTED) return;
+  lastCheck = millis();
+  int rssi = WiFi.RSSI();
+  weakChecks = rssi < -75 ? weakChecks + 1 : 0;
+  if (weakChecks < 3 || (lastScan && millis() - lastScan < 600000)) return;
+  lastScan = millis();
+  weakChecks = 0;
+  String ssid = WiFi.SSID();
+  int n = WiFi.scanNetworks(false, false, false, 120);
+  int best = -1;
+  for (int i = 0; i < n; i++)
+    if (WiFi.SSID(i) == ssid && (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best))) best = i;
+  if (best >= 0 && WiFi.RSSI(best) >= rssi + 8 && WiFi.BSSIDstr(best) != WiFi.BSSIDstr()) {
+    Serial.printf("wifi: roaming from %s (%d) to %s (%d)\n", WiFi.BSSIDstr().c_str(), rssi,
+                  WiFi.BSSIDstr(best).c_str(), WiFi.RSSI(best));
+    uint8_t bssid[6];
+    memcpy(bssid, WiFi.BSSID(best), 6);
+    int ch = WiFi.channel(best);
+    WiFi.scanDelete();
+    WiFi.begin(ssid.c_str(), prefs.getString("pass", "").c_str(), ch, bssid);
+  } else {
+    WiFi.scanDelete();
+  }
+}
+
 void loop() {
   static uint32_t offlineSince = 0;
   handleSerial();
+  roamIfWeak();
   // Self-healing: SmartCam's watchdog can power-cycle the camera, but most stalls never need it.
   if (WiFi.status() != WL_CONNECTED) {
     if (!offlineSince) offlineSince = millis();

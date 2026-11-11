@@ -67,6 +67,13 @@ in portal mode the camera reboots and tries the saved network again.
 
 If WiFi drops for more than 60 s, or the sensor stops delivering frames, the camera restarts itself.
 
+### Several access points
+
+When one network name is served by several access points, the camera joins the strongest. If its signal stays
+below −75 dBm for three minutes, it scans and moves to an access point that is at least 8 dB stronger (at most every
+ten minutes; the scan pauses the stream for a few seconds). `/status` shows the access point (`bssid`), `channel`
+and `rssi`. Around −85 dBm and below the stream stops: move the camera or add an access point nearby.
+
 Give the camera a fixed address with a DHCP reservation on its MAC (printed by `esptool flash-id`, and on the
 router's client list as `smartcam-xxxxxx`): SmartCam addresses cameras by IP.
 
@@ -91,13 +98,28 @@ Or tick `vflip` and `hmirror` on the camera's page at `http://<cam>/`.
 | `http://<cam>/status` | JSON: firmware, RSSI, uptime, stream fps, settings |
 | `http://<cam>/control?var=<name>&val=<n>` | change a setting; saved across reboots |
 | `POST http://<cam>/restart` | reboot |
-| `POST http://<cam>/update` | over-the-air update: `curl --data-binary @.pio/build/m5cam/firmware.bin http://<cam>/update` |
+| `POST http://<cam>/update` | over-the-air update, see below |
 
 Settings: `framesize` (5 = 320×240 … 9 = 800×600, 10 = 1024×768, 11 = 1280×720, 13 = 1600×1200), `quality`
 (4–63, lower is better), `maxfps`, `brightness`, `contrast`, `saturation` (−2…2), `vflip`, `hmirror`, `awb`,
 `aec`, `agc`, `gainceiling`, `lenc`, `dcw`.
 
 The camera announces itself over mDNS as `smartcam-xxxxxx.local` (the last six hex digits of its MAC).
+
+## Updating over WiFi
+
+```bash
+pio run
+curl --data-binary @.pio/build/m5cam/firmware.bin http://<cam>/update     # add -u admin:<password> if set
+```
+
+It answers `update ok, restarting` after about 10–15 s on a good link, and `/status` then shows the new
+`firmware`. The image goes to the second app slot and is checked before the camera switches to it, so a broken
+or interrupted upload leaves the running firmware in place. Update over a decent signal; a link at −85 dBm or
+worse may drop mid-upload.
+
+Firmware before 1.1.0 crashes on `/update` (its handler overflowed the web server's stack) and stays on the old
+version, so cameras on 1.0.x need one update over USB.
 
 ## In SmartCam
 
