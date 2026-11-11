@@ -34,7 +34,13 @@ Back up the factory firmware first if you may want it back:
 
 ## WiFi
 
-Either over USB serial (115200 baud), one command per line:
+The camera only does 2.4 GHz WiFi (WPA2). There are two ways to set it up.
+
+**Captive portal.** With no network configured, or none reachable for 30 s, the camera opens the access point
+**SmartCam-xxxxxx**. Join it from a phone, pick the network and enter its password (and optionally a camera
+password) in the page that opens.
+
+**USB serial** (115200 baud, e.g. `pio device monitor`), one command per line:
 
 ```
 ssid=MyNetwork
@@ -43,11 +49,37 @@ admin=camera-password      # optional: HTTP basic auth (user "admin") on every e
 reboot
 ```
 
-Or with no network configured (or none reachable for 30 s) the camera opens the access point
-**SmartCam-xxxxxx**. Join it and pick the network in the captive portal. Other serial commands: `status`,
-`factory` (wipe settings).
+Each command is confirmed with its length (`ok pass (17 bytes)`), so a mistyped password is easy to spot. Other
+commands: `status` (settings and IP as JSON), `factory` (wipe all settings).
+
+### Troubleshooting
+
+The serial log says why a join fails:
+
+| Log line | Meaning |
+|---|---|
+| `reason 15 (wrong password)` | the access point rejected the password. Check its length against the `ok pass` echo |
+| `reason 201 (network not found …)` | SSID misspelt, or the network is 5 GHz only |
+| `reason 202 (authentication refused)` / `reason 203 (association refused)` | MAC filter, client limit or WPA3-only network |
+
+A single `reason 8` while rebooting is the camera leaving its old connection, and can be ignored. After 5 minutes
+in portal mode the camera reboots and tries the saved network again.
 
 If WiFi drops for more than 60 s, or the sensor stops delivering frames, the camera restarts itself.
+
+Give the camera a fixed address with a DHCP reservation on its MAC (printed by `esptool flash-id`, and on the
+router's client list as `smartcam-xxxxxx`): SmartCam addresses cameras by IP.
+
+## Image orientation
+
+Mounted upside down? Turn the image 180° (both flips; saved on the camera, so SmartCam needs no change):
+
+```bash
+curl "http://<cam>/control?var=vflip&val=1"
+curl "http://<cam>/control?var=hmirror&val=1"
+```
+
+Or tick `vflip` and `hmirror` on the camera's page at `http://<cam>/`.
 
 ## Endpoints
 
@@ -83,7 +115,15 @@ cameras:
     detect: *m5cam
 ```
 
-With a camera password, use `http://admin:<password>@{ip}:81/stream`.
+With a camera password, use `http://admin:<password>@{ip}:81/stream`, or keep the password out of the file
+with `http://admin:${M5CAM_PASS}@{ip}:81/stream` and `M5CAM_PASS=…` in SmartCam's `.env`.
+
+Add it by editing `smartcam.yml` and restarting SmartCam, or in SmartCam's settings UI, which validates the
+config before saving. As with any indoor camera, add `record_at_home: false` to record only while the alarm is
+armed away. Detection and alerts keep running either way.
+
+Check it in SmartCam's log: `record:<name> started`, and 10 s H.264 segments under
+`recordings/<date>/<hour>/<name>/`.
 
 Why `exec:` rather than go2rtc's shorter `ffmpeg:http://…#video=h264`: MJPEG over HTTP carries no timestamps,
 and that form lets ffmpeg assume 25 fps. Tested against go2rtc 1.9.14 (the version SmartCam ships), 28 s of
