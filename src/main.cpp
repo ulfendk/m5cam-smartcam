@@ -22,7 +22,7 @@
 #include <mbedtls/base64.h>
 
 #ifndef FW_VERSION
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 #endif
 
 // M5Camera model B pin map (the M5CAM F "fisheye" board), read from the factory firmware's boot log.
@@ -311,9 +311,24 @@ static void handleSerial() {
   }
 }
 
+// Why a join failed, in words: the usual causes of a camera that will not connect.
+static void logDisconnect(WiFiEvent_t, WiFiEventInfo_t info) {
+  uint8_t r = info.wifi_sta_disconnected.reason;
+  const char *why = r == WIFI_REASON_NO_AP_FOUND                ? "network not found (2.4 GHz only)"
+                    : r == WIFI_REASON_AUTH_FAIL                ? "authentication refused"
+                    : r == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+                              r == WIFI_REASON_HANDSHAKE_TIMEOUT ? "wrong password"
+                    : r == WIFI_REASON_ASSOC_FAIL               ? "association refused"
+                                                                : "other";
+  Serial.printf("wifi: disconnected from '%s', reason %u (%s)\n", (const char *)info.wifi_sta_disconnected.ssid, r, why);
+}
+
 static bool connectWiFi(uint32_t timeoutMs) {
   String ssid = prefs.getString("ssid", "");
   if (ssid.isEmpty()) return false;
+  static bool hooked = false;
+  if (!hooked) WiFi.onEvent(logDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED), hooked = true;
+  Serial.printf("wifi: joining '%s'\n", ssid.c_str());
   WiFi.begin(ssid.c_str(), prefs.getString("pass", "").c_str());
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
