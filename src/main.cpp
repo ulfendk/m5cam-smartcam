@@ -22,7 +22,7 @@
 #include <mbedtls/base64.h>
 
 #ifndef FW_VERSION
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.2"
 #endif
 
 // M5Camera model B pin map (the M5CAM F "fisheye" board), read from the factory firmware's boot log.
@@ -298,11 +298,12 @@ static void handleSerial() {
     }
     String cmd = line;
     line = "";
-    cmd.trim();
+    // Only the key is trimmed: SSIDs and passwords may start or end with spaces.
     int eq = cmd.indexOf('=');
     String key = eq < 0 ? cmd : cmd.substring(0, eq), val = eq < 0 ? "" : cmd.substring(eq + 1);
-    if (key == "ssid") { prefs.putString("ssid", val); Serial.println("ok ssid"); }
-    else if (key == "pass") { prefs.putString("pass", val); Serial.println("ok pass"); }
+    key.trim();
+    if (key == "ssid") { prefs.putString("ssid", val); Serial.printf("ok ssid (%u bytes)\n", val.length()); }
+    else if (key == "pass") { prefs.putString("pass", val); Serial.printf("ok pass (%u bytes)\n", val.length()); }
     else if (key == "admin") { prefs.putString("admin", val); loadAuth(); Serial.println("ok admin"); }
     else if (key == "status") Serial.println(statusJson());
     else if (key == "reboot") { Serial.println("ok reboot"); delay(100); ESP.restart(); }
